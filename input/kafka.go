@@ -150,7 +150,6 @@ func (k *Kafka) BatchCh() chan Batch {
 // kafka main loop
 func (k *Kafka) Run(ctx context.Context) {
 	k.ctx = ctx
-	numRings := len(k.rings)
 LOOP:
 	for {
 		var err error
@@ -170,88 +169,94 @@ LOOP:
 				continue
 			}
 		}
-		statistics.ConsumeMsgsTotal.WithLabelValues(k.taskCfg.Name).Inc()
-		// ensure ring for this message exist
-		k.mux.Lock()
-		var ring *Ring
-		if msg.Partition < numRings {
-			ring = k.rings[msg.Partition]
-		} else {
-			for i := numRings; i < msg.Partition+1; i++ {
-				k.rings = append(k.rings, nil)
-			}
-			numRings = msg.Partition + 1
-		}
-		if ring == nil {
-			batchSizeShift := util.GetShift(k.taskCfg.BufferSize)
-			ringCap := int64(1 << (batchSizeShift + 1))
-			ring := &Ring{
-				ringBuf:          make([]MsgRow, ringCap),
-				ringCap:          ringCap,
-				ringGroundOff:    msg.Offset,
-				ringCeilingOff:   msg.Offset,
-				ringFilledOffset: msg.Offset,
-				batchSizeShift:   batchSizeShift,
-				idleCnt:          0,
-				isIdle:           false,
-				partition:        msg.Partition,
-				kafka:            k,
-			}
-			// schedule a delayed ForceBatch
-			if ring.tid, err = util.GlobalTimerWheel.Schedule(time.Duration(k.taskCfg.FlushInterval)*time.Second, ring.ForceBatch, nil); err != nil {
-				err = errors.Wrap(err, "")
-				log.Criticalf("got error %+v", err)
-			}
-			k.rings[msg.Partition] = ring
-			k.mux.Unlock()
-		} else {
-			k.mux.Unlock()
-			var ringGroundOff int64
-			ring.mux.Lock()
-			ringGroundOff = ring.ringGroundOff
-			ring.mux.Unlock()
-			if msg.Offset < ringGroundOff {
-				statistics.RingMsgsOffTooSmallErrorTotal.WithLabelValues(ring.kafka.taskCfg.Name).Inc()
-				if ring.kafka.limiter2.Allow() {
-					log.Warnf("got a message(topic %v, partition %d, offset %v) is left to the range [%v, %v)",
-						msg.Topic, msg.Partition, msg.Offset, ring.ringGroundOff, ring.ringGroundOff+ring.ringCap)
-				}
-				continue LOOP
-			}
-			if msg.Offset >= ringGroundOff+ring.ringCap {
-				statistics.RingMsgsOffTooLargeErrorTotal.WithLabelValues(ring.kafka.taskCfg.Name).Inc()
-				if ring.kafka.limiter3.Allow() {
-					log.Warnf("got a message(topic %v, partition %d, offset %v) is right to the range [%v, %v)",
-						msg.Topic, msg.Partition, msg.Offset, ring.ringGroundOff, ring.ringGroundOff+ring.ringCap)
-				}
-				time.Sleep(1 * time.Second)
-				ring.ForceBatch(&msg)
-				// assert ring.ringGroundOff==ring.ringFilledOff==msg.Offset
-			}
-		}
-		// submit message to a goroutine pool
-		statistics.ParseMsgsBacklog.WithLabelValues(k.taskCfg.Name).Inc()
-		_ = util.GlobalWorkerPool1.Submit(func() {
-			var row []interface{}
-			p := k.pp.Get()
-			metric, err := p.Parse(msg.Value)
-			if err != nil {
-				statistics.ParseMsgsErrorTotal.WithLabelValues(k.taskCfg.Name).Inc()
-				if k.limiter1.Allow() {
-					log.Errorf("failed to parse message(topic %v, partition %d, offset %v) %+v, string(value) <<<%+v>>>, got error %+v",
-						msg.Topic, msg.Partition, msg.Offset, msg, string(msg.Value), err)
-				}
-			} else {
-				row = MetricToRow(metric, msg, k.dims)
-			}
-			k.pp.Put(p)
-			var ring *Ring
-			k.mux.Lock()
-			ring = k.rings[msg.Partition]
-			k.mux.Unlock()
-			ring.PutElem(MsgRow{Msg: &msg, Row: row})
-		})
+		k.handleMsg(&msg)
 	}
+}
+
+func (k *Kafka) handleMsg(msg *kafka.Message) {
+	var err error
+	var ring *Ring
+	statistics.ConsumeMsgsTotal.WithLabelValues(k.taskCfg.Name).Inc()
+	// ensure ring for this message exist
+	k.mux.Lock()
+	numRings := len(k.rings)
+	if msg.Partition < numRings {
+		ring = k.rings[msg.Partition]
+	} else {
+		for i := numRings; i < msg.Partition+1; i++ {
+			k.rings = append(k.rings, nil)
+		}
+		numRings = msg.Partition + 1
+	}
+	if ring == nil {
+		batchSizeShift := util.GetShift(k.taskCfg.BufferSize)
+		ringCap := int64(1 << (batchSizeShift + 1))
+		ring := &Ring{
+			ringBuf:          make([]MsgRow, ringCap),
+			ringCap:          ringCap,
+			ringGroundOff:    msg.Offset,
+			ringCeilingOff:   msg.Offset,
+			ringFilledOffset: msg.Offset,
+			batchSizeShift:   batchSizeShift,
+			idleCnt:          0,
+			isIdle:           false,
+			partition:        msg.Partition,
+			kafka:            k,
+		}
+		// schedule a delayed ForceBatch
+		if ring.tid, err = util.GlobalTimerWheel.Schedule(time.Duration(k.taskCfg.FlushInterval)*time.Second, ring.ForceBatch, nil); err != nil {
+			err = errors.Wrap(err, "")
+			log.Criticalf("got error %+v", err)
+		}
+		k.rings[msg.Partition] = ring
+		k.mux.Unlock()
+	} else {
+		k.mux.Unlock()
+		var ringGroundOff int64
+		ring.mux.Lock()
+		ringGroundOff = ring.ringGroundOff
+		ring.mux.Unlock()
+		if msg.Offset < ringGroundOff {
+			statistics.RingMsgsOffTooSmallErrorTotal.WithLabelValues(ring.kafka.taskCfg.Name).Inc()
+			if ring.kafka.limiter2.Allow() {
+				log.Warnf("got a message(topic %v, partition %d, offset %v) is left to the range [%v, %v)",
+					msg.Topic, msg.Partition, msg.Offset, ring.ringGroundOff, ring.ringGroundOff+ring.ringCap)
+			}
+			return
+		}
+		if msg.Offset >= ringGroundOff+ring.ringCap {
+			statistics.RingMsgsOffTooLargeErrorTotal.WithLabelValues(ring.kafka.taskCfg.Name).Inc()
+			if ring.kafka.limiter3.Allow() {
+				log.Warnf("got a message(topic %v, partition %d, offset %v) is right to the range [%v, %v)",
+					msg.Topic, msg.Partition, msg.Offset, ring.ringGroundOff, ring.ringGroundOff+ring.ringCap)
+			}
+			time.Sleep(1 * time.Second)
+			ring.ForceBatch(&msg)
+			// assert ring.ringGroundOff==ring.ringFilledOff==msg.Offset
+		}
+	}
+	// submit message to a goroutine pool
+	statistics.ParseMsgsBacklog.WithLabelValues(k.taskCfg.Name).Inc()
+	_ = util.GlobalWorkerPool1.Submit(func() {
+		var row []interface{}
+		p := k.pp.Get()
+		metric, err := p.Parse(msg.Value)
+		if err != nil {
+			statistics.ParseMsgsErrorTotal.WithLabelValues(k.taskCfg.Name).Inc()
+			if k.limiter1.Allow() {
+				log.Errorf("failed to parse message(topic %v, partition %d, offset %v) %+v, string(value) <<<%+v>>>, got error %+v",
+					msg.Topic, msg.Partition, msg.Offset, msg, string(msg.Value), err)
+			}
+		} else {
+			row = MetricToRow(metric, msg, k.dims)
+		}
+		k.pp.Put(p)
+		var ring *Ring
+		k.mux.Lock()
+		ring = k.rings[msg.Partition]
+		k.mux.Unlock()
+		ring.PutElem(MsgRow{Msg: msg, Row: row})
+	})
 }
 
 // Stop kafka consumer and close all connections
@@ -413,7 +418,7 @@ func (ring *Ring) genBatch(expNewGroundOff int64) (gaps []OffsetRange) {
 	return
 }
 
-func MetricToRow(metric model.Metric, msg kafka.Message, dims []*model.ColumnWithType) (row []interface{}) {
+func MetricToRow(metric model.Metric, msg *kafka.Message, dims []*model.ColumnWithType) (row []interface{}) {
 	row = make([]interface{}, len(dims))
 	for i, dim := range dims {
 		if strings.HasPrefix(dim.Name, "__kafka") {
