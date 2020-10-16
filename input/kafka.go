@@ -17,15 +17,14 @@ package input
 
 import (
 	"context"
-	"io"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Shopify/sarama"
 	"github.com/fagongzi/goetty"
 	"github.com/pkg/errors"
-	"github.com/segmentio/kafka-go"
 	"github.com/sundy-li/go_commons/log"
 	"golang.org/x/time/rate"
 
@@ -41,7 +40,8 @@ type Kafka struct {
 	taskCfg  *config.TaskConfig
 	pp       *parser.Pool
 	dims     []*model.ColumnWithType
-	r        *kafka.Reader
+	cg       sarama.ConsumerGroup
+	sess     sarama.ConsumerGroupSession
 	mux      sync.Mutex
 	rings    []*Ring
 	batchCh  chan Batch
@@ -68,7 +68,7 @@ type Ring struct {
 }
 
 type MsgRow struct {
-	Msg *kafka.Message
+	Msg *sarama.ConsumerMessage
 	Row []interface{}
 }
 
@@ -76,7 +76,26 @@ type Batch struct {
 	MsgRows  []MsgRow
 	RealSize int    //number of messages who's row!=nil
 	BatchNum int64  //msg.Offset>>batchSizeShift is the same for all messages inside a batch
-	kafka    *Kafka //point back to who hold this ring
+	kafka    *Kafka //point back to which kafka this batch belongs to
+}
+
+type MyConsumerGroupHandler struct {
+	k *Kafka //point back to which kafka this handler belongs to
+}
+
+func (h MyConsumerGroupHandler) Setup(sess sarama.ConsumerGroupSession) error {
+	h.k.sess = sess
+	return nil
+}
+func (h MyConsumerGroupHandler) Cleanup(_ sarama.ConsumerGroupSession) error {
+	return nil
+}
+
+func (h MyConsumerGroupHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	for msg := range claim.Messages() {
+		h.k.handleMsg(msg)
+	}
+	return nil
 }
 
 func NewBatch(batchSize int, k *Kafka) (batch Batch) {
@@ -93,18 +112,15 @@ func (batch Batch) Free() (err error) {
 	}
 	// "io: read/write on closed pipe" makes caller hard to tell what happened. context.Canceled is better.
 	select {
-	case <-batch.kafka.ctx.Done():
+	case <-batch.kafka.sess.Context().Done():
 		err = errors.Wrap(context.Canceled, "")
 		return
 	default:
 	}
 	// Commit only the last message inside a batch since messages come from the same topic and partition, and are sorted per offset
 	lastMsg := batch.MsgRows[numMsgs-1].Msg
-	if err = batch.kafka.r.CommitMessages(batch.kafka.ctx, *lastMsg); err != nil {
-		err = errors.Wrap(err, "")
-		return
-	}
-	statistics.ConsumeOffsets.WithLabelValues(batch.kafka.taskCfg.Name, strconv.Itoa(lastMsg.Partition), lastMsg.Topic).Set(float64(lastMsg.Offset))
+	batch.kafka.sess.MarkMessage(lastMsg, "")
+	statistics.ConsumeOffsets.WithLabelValues(batch.kafka.taskCfg.Name, strconv.Itoa(int(lastMsg.Partition)), lastMsg.Topic).Set(float64(lastMsg.Offset))
 	return
 }
 
@@ -120,21 +136,32 @@ func (k *Kafka) Init(dims []*model.ColumnWithType) error {
 	k.stopped = make(chan struct{})
 	k.dims = dims
 
-	offset := kafka.LastOffset
-	if k.taskCfg.Earliest {
-		offset = kafka.FirstOffset
+	config := sarama.NewConfig()
+	if kfkCfg.Version != "" {
+		version, err := sarama.ParseKafkaVersion(kfkCfg.Version)
+		if err != nil {
+			err = errors.Wrap(err, "")
+			return err
+		}
+		config.Version = version
 	}
+	// sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
+	// check for authentication
+	if kfkCfg.Sasl.Username != "" {
+		config.Net.SASL.Enable = true
+		config.Net.SASL.User = kfkCfg.Sasl.Username
+		config.Net.SASL.Password = kfkCfg.Sasl.Password
+	}
+	if k.taskCfg.Earliest {
+		config.Consumer.Offsets.Initial = sarama.OffsetOldest
+	}
+	config.ChannelBufferSize = k.taskCfg.MinBufferSize
+	cg, err := sarama.NewConsumerGroup(strings.Split(kfkCfg.Brokers, ","), k.taskCfg.ConsumerGroup, config)
+	if err != nil {
+		return err
+	}
+	k.cg = cg
 
-	k.r = kafka.NewReader(kafka.ReaderConfig{
-		Brokers:        strings.Split(kfkCfg.Brokers, ","),
-		GroupID:        k.taskCfg.ConsumerGroup,
-		Topic:          k.taskCfg.Topic,
-		StartOffset:    offset,
-		MinBytes:       k.taskCfg.MinBufferSize * k.taskCfg.MsgSizeHint,
-		MaxBytes:       k.taskCfg.BufferSize * k.taskCfg.MsgSizeHint,
-		MaxWait:        time.Duration(k.taskCfg.FlushInterval) * time.Second,
-		CommitInterval: time.Second, // flushes commits to Kafka every second
-	})
 	k.rings = make([]*Ring, 0)
 	k.batchCh = make(chan Batch, 32)
 	k.limiter1 = rate.NewLimiter(rate.Every(10*time.Second), 1)
@@ -152,15 +179,17 @@ func (k *Kafka) Run(ctx context.Context) {
 	k.ctx = ctx
 LOOP:
 	for {
-		var err error
-		var msg kafka.Message
-		if msg, err = k.r.FetchMessage(ctx); err != nil {
+		handler := MyConsumerGroupHandler{k}
+		// `Consume` should be called inside an infinite loop, when a
+		// server-side rebalance happens, the consumer session will need to be
+		// recreated to get the new claims
+		if err := k.cg.Consume(ctx, []string{k.taskCfg.Topic}, handler); err != nil {
 			switch errors.Cause(err) {
 			case context.Canceled:
 				log.Infof("%s Kafka.Run quit due to context has been canceled", k.taskCfg.Name)
 				break LOOP
-			case io.EOF:
-				log.Infof("%s Kafka.Run quit due to reader has been closed", k.taskCfg.Name)
+			case sarama.ErrClosedConsumerGroup:
+				log.Infof("%s Kafka.Run quit due to consumer group has been closed", k.taskCfg.Name)
 				break LOOP
 			default:
 				statistics.ConsumeMsgsErrorTotal.WithLabelValues(k.taskCfg.Name).Inc()
@@ -169,24 +198,23 @@ LOOP:
 				continue
 			}
 		}
-		k.handleMsg(&msg)
 	}
 }
 
-func (k *Kafka) handleMsg(msg *kafka.Message) {
+func (k *Kafka) handleMsg(msg *sarama.ConsumerMessage) {
 	var err error
 	var ring *Ring
 	statistics.ConsumeMsgsTotal.WithLabelValues(k.taskCfg.Name).Inc()
 	// ensure ring for this message exist
 	k.mux.Lock()
 	numRings := len(k.rings)
-	if msg.Partition < numRings {
+	if int(msg.Partition) < numRings {
 		ring = k.rings[msg.Partition]
 	} else {
-		for i := numRings; i < msg.Partition+1; i++ {
+		for i := numRings; i < int(msg.Partition)+1; i++ {
 			k.rings = append(k.rings, nil)
 		}
-		numRings = msg.Partition + 1
+		numRings = int(msg.Partition) + 1
 	}
 	if ring == nil {
 		batchSizeShift := util.GetShift(k.taskCfg.BufferSize)
@@ -200,7 +228,7 @@ func (k *Kafka) handleMsg(msg *kafka.Message) {
 			batchSizeShift:   batchSizeShift,
 			idleCnt:          0,
 			isIdle:           false,
-			partition:        msg.Partition,
+			partition:        int(msg.Partition),
 			kafka:            k,
 		}
 		// schedule a delayed ForceBatch
@@ -231,7 +259,7 @@ func (k *Kafka) handleMsg(msg *kafka.Message) {
 					msg.Topic, msg.Partition, msg.Offset, ring.ringGroundOff, ring.ringGroundOff+ring.ringCap)
 			}
 			time.Sleep(1 * time.Second)
-			ring.ForceBatch(&msg)
+			ring.ForceBatch(msg)
 			// assert ring.ringGroundOff==ring.ringFilledOff==msg.Offset
 		}
 	}
@@ -261,7 +289,7 @@ func (k *Kafka) handleMsg(msg *kafka.Message) {
 
 // Stop kafka consumer and close all connections
 func (k *Kafka) Stop() error {
-	_ = k.r.Close()
+	_ = k.cg.Close()
 	return nil
 }
 
@@ -307,7 +335,7 @@ type OffsetRange struct {
 func (ring *Ring) ForceBatch(arg interface{}) {
 	var (
 		err    error
-		newMsg *kafka.Message
+		newMsg *sarama.ConsumerMessage
 		gaps   []OffsetRange
 	)
 
@@ -321,7 +349,7 @@ func (ring *Ring) ForceBatch(arg interface{}) {
 	ring.mux.Lock()
 	defer ring.mux.Unlock()
 	if arg != nil {
-		newMsg = arg.(*kafka.Message)
+		newMsg = arg.(*sarama.ConsumerMessage)
 		log.Warnf("Ring.ForceBatchAll partition %d message range [%d, %d)", newMsg.Partition, ring.ringGroundOff, newMsg.Offset)
 	}
 	if !ring.isIdle {
@@ -418,14 +446,14 @@ func (ring *Ring) genBatch(expNewGroundOff int64) (gaps []OffsetRange) {
 	return
 }
 
-func MetricToRow(metric model.Metric, msg *kafka.Message, dims []*model.ColumnWithType) (row []interface{}) {
+func MetricToRow(metric model.Metric, msg *sarama.ConsumerMessage, dims []*model.ColumnWithType) (row []interface{}) {
 	row = make([]interface{}, len(dims))
 	for i, dim := range dims {
 		if strings.HasPrefix(dim.Name, "__kafka") {
 			if strings.HasSuffix(dim.Name, "_topic") {
 				row[i] = msg.Topic
 			} else if strings.HasSuffix(dim.Name, "_partition") {
-				row[i] = msg.Partition
+				row[i] = int(msg.Partition)
 			} else {
 				row[i] = msg.Offset
 			}
