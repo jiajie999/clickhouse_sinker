@@ -147,10 +147,16 @@ func (k *Kafka) Init(dims []*model.ColumnWithType) error {
 	}
 	// sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
 	// check for authentication
-	if kfkCfg.Sasl.Username != "" {
+	if kfkCfg.Sasl.Enable {
 		config.Net.SASL.Enable = true
-		config.Net.SASL.User = kfkCfg.Sasl.Username
-		config.Net.SASL.Password = kfkCfg.Sasl.Password
+		if kfkCfg.Sasl.Username != "" {
+			config.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+			config.Net.SASL.User = kfkCfg.Sasl.Username
+			config.Net.SASL.Password = kfkCfg.Sasl.Password
+		} else {
+			config.Net.SASL.Mechanism = sarama.SASLTypeGSSAPI
+			config.Net.SASL.GSSAPI = kfkCfg.Sasl.GSSAPI
+		}
 	}
 	if k.taskCfg.Earliest {
 		config.Consumer.Offsets.Initial = sarama.OffsetOldest
